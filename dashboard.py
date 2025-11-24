@@ -200,12 +200,13 @@ def calculate_regression(X, Y, N, k, p):
 results = calculate_regression(X, Y, N, k, p)
 
 # Create tabs
-tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
+tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs([
     "📈 Overview", 
     "📊 Model Summary", 
     "🔍 Coefficients", 
     "📉 Diagnostics",
     "🎯 Predictions",
+    "🔮 Testing Prediction",
     "📐 Data Explorer"
 ])
 
@@ -517,8 +518,387 @@ with tab5:
         use_container_width=True
     )
 
-# TAB 6: Data Explorer
+# TAB 6: Testing Prediction
 with tab6:
+    st.header("🔮 Testing Prediction")
+    st.write("Predict new values by entering feature values manually")
+    
+    # Helper functions
+    def predict_new_data(new_data_dict, B_hat, features):
+        try:
+            X_new = np.array([new_data_dict[name] for name in features]).reshape(1, -1)
+            X_new_with_intercept = np.hstack([np.ones((1, 1)), X_new])
+            Y_pred = X_new_with_intercept @ B_hat
+            return Y_pred[0][0], None
+        except Exception as e:
+            return None, str(e)
+    
+    def predict_with_confidence_interval(new_data_dict, B_hat, features, MSE, XTX_inv, t_critical):
+        try:
+            X_new = np.array([new_data_dict[name] for name in features]).reshape(1, -1)
+            X_new_with_intercept = np.hstack([np.ones((1, 1)), X_new])
+            Y_pred = (X_new_with_intercept @ B_hat)[0][0]
+            
+            SE_pred = np.sqrt(MSE * (1 + X_new_with_intercept @ XTX_inv @ X_new_with_intercept.T))
+            SE_pred = SE_pred[0][0]
+            
+            CI_lower = Y_pred - t_critical * SE_pred
+            CI_upper = Y_pred + t_critical * SE_pred
+            
+            return Y_pred, CI_lower, CI_upper, SE_pred, None
+        except Exception as e:
+            return None, None, None, None, str(e)
+    
+    # Get XTX_inv from results
+    XTX = X.T @ X
+    XTX_inv = np.linalg.inv(XTX)
+    t_critical = t.ppf(0.975, results['df_residual'])
+    
+    # Tabs untuk prediction modes
+    pred_tab1, pred_tab2, pred_tab3 = st.tabs([
+        "📝 Single Prediction", 
+        "📊 Scenario Analysis", 
+        "📦 Batch Prediction"
+    ])
+    
+    # SUB-TAB 1: Single Prediction
+    with pred_tab1:
+        st.subheader("Enter Feature Values")
+        
+        col1, col2 = st.columns(2)
+        new_data = {}
+        
+        for i, feature in enumerate(selected_features):
+            # Get statistics for default values
+            mean_val = df_clean[feature].mean()
+            min_val = float(df_clean[feature].min())
+            max_val = float(df_clean[feature].max())
+            
+            with col1 if i % 2 == 0 else col2:
+                new_data[feature] = st.number_input(
+                    f"{feature[:50]}{'...' if len(feature) > 50 else ''}",
+                    value=float(mean_val),
+                    min_value=min_val,
+                    max_value=max_val,
+                    format="%.4f",
+                    key=f"single_{i}"
+                )
+        
+        if st.button("🎯 Predict", type="primary", key="predict_single"):
+            prediction, error = predict_new_data(new_data, results['B_hat'], selected_features)
+            
+            if error:
+                st.error(f"❌ Prediction failed: {error}")
+            else:
+                pred_with_ci, ci_lower, ci_upper, se, error_ci = predict_with_confidence_interval(
+                    new_data, results['B_hat'], selected_features, 
+                    results['MSE'], XTX_inv, t_critical
+                )
+                
+                if error_ci:
+                    st.error(f"❌ CI calculation failed: {error_ci}")
+                else:
+                    st.success("✅ Prediction successful!")
+                    
+                    # Display results
+                    col1, col2, col3 = st.columns(3)
+                    with col1:
+                        st.metric("Predicted Value", f"{prediction:.4f}")
+                    with col2:
+                        st.metric("Standard Error", f"{se:.4f}")
+                    with col3:
+                        st.metric("95% CI Width", f"{ci_upper - ci_lower:.4f}")
+                    
+                    st.info(f"📊 **95% Confidence Interval:** [{ci_lower:.4f}, {ci_upper:.4f}]")
+                    
+                    # Visualization
+                    fig = go.Figure()
+                    
+                    fig.add_trace(go.Scatter(
+                        x=[prediction],
+                        y=['Prediction'],
+                        error_x=dict(
+                            type='data',
+                            symmetric=False,
+                            array=[ci_upper - prediction],
+                            arrayminus=[prediction - ci_lower],
+                            color='lightblue',
+                            thickness=10
+                        ),
+                        mode='markers',
+                        marker=dict(size=15, color='red'),
+                        name='Prediction with 95% CI'
+                    ))
+                    
+                    fig.update_layout(
+                        title='Prediction with Confidence Interval',
+                        xaxis_title=target,
+                        height=300,
+                        showlegend=False
+                    )
+                    
+                    st.plotly_chart(fig, use_container_width=True)
+    
+    # SUB-TAB 2: Scenario Analysis
+    with pred_tab2:
+        st.subheader("Compare Multiple Scenarios")
+        
+        # Baseline values
+        st.write("**Baseline Scenario (Mean Values)**")
+        baseline_data = {feature: df_clean[feature].mean() for feature in selected_features}
+        
+        # Display baseline
+        baseline_cols = st.columns(min(3, len(selected_features)))
+        for i, (feature, value) in enumerate(baseline_data.items()):
+            with baseline_cols[i % min(3, len(selected_features))]:
+                st.metric(feature[:30], f"{value:.2f}")
+        
+        st.divider()
+        
+        # Scenario builder
+        st.write("**Create Scenarios**")
+        num_scenarios = st.number_input("Number of scenarios", min_value=1, max_value=5, value=3)
+        
+        scenarios = {'Baseline': baseline_data.copy()}
+        
+        for i in range(num_scenarios):
+            with st.expander(f"Scenario {i+1}"):
+                scenario_name = st.text_input(f"Scenario {i+1} Name", value=f"Scenario {i+1}", key=f"scenario_name_{i}")
+                
+                scenario_data = baseline_data.copy()
+                
+                # Select feature to modify
+                feature_to_modify = st.selectbox(
+                    "Select feature to modify", 
+                    selected_features,
+                    key=f"scenario_feature_{i}"
+                )
+                
+                # Modify value
+                change_type = st.radio(
+                    "Change type",
+                    ["Absolute Value", "Percentage Change"],
+                    key=f"scenario_change_type_{i}",
+                    horizontal=True
+                )
+                
+                if change_type == "Absolute Value":
+                    new_value = st.number_input(
+                        f"New value for {feature_to_modify}",
+                        value=float(baseline_data[feature_to_modify]),
+                        key=f"scenario_value_{i}"
+                    )
+                    scenario_data[feature_to_modify] = new_value
+                else:
+                    pct_change = st.slider(
+                        "Percentage change",
+                        min_value=-50,
+                        max_value=50,
+                        value=0,
+                        key=f"scenario_pct_{i}"
+                    )
+                    scenario_data[feature_to_modify] = baseline_data[feature_to_modify] * (1 + pct_change/100)
+                
+                scenarios[scenario_name] = scenario_data
+        
+        if st.button("📊 Compare Scenarios", type="primary", key="compare_scenarios"):
+            # Calculate predictions for all scenarios
+            scenario_results = []
+            baseline_pred, _ = predict_new_data(scenarios['Baseline'], results['B_hat'], selected_features)
+            
+            for scenario_name, scenario_data in scenarios.items():
+                pred, error = predict_new_data(scenario_data, results['B_hat'], selected_features)
+                
+                if not error:
+                    change = pred - baseline_pred if scenario_name != 'Baseline' else 0
+                    pct_change = (change / baseline_pred * 100) if baseline_pred != 0 and scenario_name != 'Baseline' else 0
+                    
+                    scenario_results.append({
+                        'Scenario': scenario_name,
+                        'Prediction': pred,
+                        'Change': change,
+                        'Change (%)': pct_change
+                    })
+            
+            # Display results
+            results_df = pd.DataFrame(scenario_results)
+            
+            st.dataframe(
+                results_df.style.format({
+                    'Prediction': '{:.4f}',
+                    'Change': '{:+.4f}',
+                    'Change (%)': '{:+.2f}%'
+                }).background_gradient(subset=['Prediction'], cmap='RdYlGn_r'),
+                hide_index=True,
+                use_container_width=True
+            )
+            
+            # Visualization
+            fig = go.Figure()
+            
+            colors = ['blue' if name == 'Baseline' else 'green' if change > 0 else 'red' 
+                     for name, change in zip(results_df['Scenario'], results_df['Change'])]
+            
+            fig.add_trace(go.Bar(
+                x=results_df['Prediction'],
+                y=results_df['Scenario'],
+                orientation='h',
+                marker_color=colors,
+                text=results_df['Prediction'].round(4),
+                textposition='outside'
+            ))
+            
+            fig.update_layout(
+                title='Scenario Comparison',
+                xaxis_title=f'Predicted {target}',
+                yaxis_title='Scenario',
+                height=max(300, len(scenarios) * 60)
+            )
+            
+            st.plotly_chart(fig, use_container_width=True)
+    
+    # SUB-TAB 3: Batch Prediction
+    with pred_tab3:
+        st.subheader("Batch Prediction from CSV or Manual Entry")
+        
+        upload_method = st.radio(
+            "Select input method",
+            ["Upload CSV", "Manual Entry"],
+            horizontal=True
+        )
+        
+        if upload_method == "Upload CSV":
+            st.write("Upload a CSV file with the same features as the training data")
+            
+            batch_file = st.file_uploader("Upload CSV for batch prediction", type=['csv'], key="batch_upload")
+            
+            if batch_file is not None:
+                try:
+                    batch_df = pd.read_csv(batch_file)
+                    st.write(f"Loaded {len(batch_df)} rows")
+                    
+                    # Check if all features are present
+                    missing_features = [f for f in selected_features if f not in batch_df.columns]
+                    
+                    if missing_features:
+                        st.error(f"❌ Missing features: {', '.join(missing_features)}")
+                    else:
+                        st.success("✅ All required features found!")
+                        
+                        if st.button("🎯 Predict Batch", type="primary", key="predict_batch_csv"):
+                            # Prepare batch data
+                            X_batch_raw = batch_df[selected_features].values
+                            X_batch = np.hstack([np.ones((len(X_batch_raw), 1)), X_batch_raw])
+                            
+                            # Predict
+                            Y_batch_pred = X_batch @ results['B_hat']
+                            
+                            # Add predictions to dataframe
+                            batch_df['Predicted_Value'] = Y_batch_pred.flatten()
+                            
+                            st.success(f"✅ Predicted {len(batch_df)} values!")
+                            
+                            # Display results
+                            st.dataframe(
+                                batch_df.style.format({'Predicted_Value': '{:.4f}'}),
+                                use_container_width=True
+                            )
+                            
+                            # Download button
+                            csv = batch_df.to_csv(index=False)
+                            st.download_button(
+                                "📥 Download Predictions",
+                                csv,
+                                "predictions.csv",
+                                "text/csv",
+                                key='download_batch_csv'
+                            )
+                            
+                            # Visualization
+                            fig = go.Figure()
+                            fig.add_trace(go.Scatter(
+                                x=list(range(1, len(batch_df) + 1)),
+                                y=batch_df['Predicted_Value'],
+                                mode='lines+markers',
+                                marker=dict(size=8, color='blue'),
+                                line=dict(color='lightblue', width=2),
+                                name='Predictions'
+                            ))
+                            
+                            fig.update_layout(
+                                title='Batch Prediction Results',
+                                xaxis_title='Observation',
+                                yaxis_title=f'Predicted {target}',
+                                height=400
+                            )
+                            
+                            st.plotly_chart(fig, use_container_width=True)
+                
+                except Exception as e:
+                    st.error(f"❌ Error processing file: {str(e)}")
+        
+        else:  # Manual Entry
+            st.write("Enter multiple observations manually")
+            
+            num_observations = st.number_input("Number of observations", min_value=1, max_value=10, value=3)
+            
+            manual_data = []
+            
+            for obs_idx in range(num_observations):
+                with st.expander(f"Observation {obs_idx + 1}"):
+                    obs_data = {}
+                    cols = st.columns(2)
+                    
+                    for i, feature in enumerate(selected_features):
+                        mean_val = df_clean[feature].mean()
+                        
+                        with cols[i % 2]:
+                            obs_data[feature] = st.number_input(
+                                f"{feature[:40]}",
+                                value=float(mean_val),
+                                key=f"manual_{obs_idx}_{i}"
+                            )
+                    
+                    manual_data.append(obs_data)
+            
+            if st.button("🎯 Predict Manual Batch", type="primary", key="predict_batch_manual"):
+                # Prepare batch data
+                X_batch_raw = np.array([[obs[f] for f in selected_features] for obs in manual_data])
+                X_batch = np.hstack([np.ones((len(X_batch_raw), 1)), X_batch_raw])
+                
+                # Predict
+                Y_batch_pred = X_batch @ results['B_hat']
+                
+                # Create results dataframe
+                results_list = []
+                for i, (obs, pred) in enumerate(zip(manual_data, Y_batch_pred.flatten())):
+                    row = {'Observation': i + 1}
+                    row.update(obs)
+                    row['Predicted_Value'] = pred
+                    results_list.append(row)
+                
+                manual_results_df = pd.DataFrame(results_list)
+                
+                st.success(f"✅ Predicted {len(manual_results_df)} values!")
+                
+                # Display results
+                st.dataframe(
+                    manual_results_df.style.format({col: '{:.4f}' for col in manual_results_df.columns if col != 'Observation'}),
+                    use_container_width=True
+                )
+                
+                # Download button
+                csv = manual_results_df.to_csv(index=False)
+                st.download_button(
+                    "📥 Download Predictions",
+                    csv,
+                    "manual_predictions.csv",
+                    "text/csv",
+                    key='download_batch_manual'
+                )
+
+# TAB 7: Data Explorer
+with tab7:
     st.header("Data Exploration")
     
     # Target distribution
